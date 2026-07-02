@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TR Viewer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Sans:ital,opsz,wght@0,9..40,200..700;1,9..40,200..700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+  <nav id="sidebar">
+    <div class="sidebar-brand">
+      <span class="brand-mark">⟐</span>
+      <span class="brand-text">TR Viewer</span>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-label">Navigation</div>
+      <button class="nav-btn active" data-view="dashboard">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        Dashboard
+      </button>
+      <button class="nav-btn" data-view="etf-detail">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Par ETF
+      </button>
+      <button class="nav-btn" data-view="transactions">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        Transactions
+      </button>
+    </div>
+    <div class="sidebar-section" id="etf-list-section" style="display:none">
+      <div class="sidebar-label">Mes ETFs</div>
+      <div id="etf-list"></div>
+    </div>
+    <div class="sidebar-footer">
+      <label class="upload-area" for="csv-upload">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        Importer CSV
+      </label>
+      <input type="file" id="csv-upload" accept=".csv" style="display:none">
+    </div>
+  </nav>
+
+  <main id="main-content">
+    <div id="view-dashboard" class="view active">
+      <div class="view-header">
+        <h1>Portfolio</h1>
+        <p class="view-subtitle">Vue d'ensemble de vos investissements</p>
+      </div>
+      <div class="kpi-row" id="kpi-row"></div>
+      <div class="charts-grid">
+        <div class="card chart-card wide">
+          <div class="card-header">
+            <h3>Valeur du portefeuille</h3>
+          </div>
+          <div class="card-body chart-container">
+            <canvas id="portfolio-chart"></canvas>
+          </div>
+        </div>
+        <div class="card chart-card">
+          <div class="card-header">
+            <h3>Répartition par ETF</h3>
+          </div>
+          <div class="card-body chart-container doughnut-wrap">
+            <canvas id="allocation-chart"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Détention actuelle</h3>
+        </div>
+        <div class="card-body">
+          <table class="data-table" id="holdings-table">
+            <thead>
+              <tr>
+                <th>ETF</th>
+                <th>Parts</th>
+                <th>Prix moyen</th>
+                <th>Investi</th>
+                <th>Dernier prix</th>
+                <th>Valeur actuelle</th>
+                <th>P&L</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="view-etf-detail" class="view">
+      <div class="view-header">
+        <h1 id="etf-detail-title">Détail ETF</h1>
+        <p class="view-subtitle" id="etf-detail-subtitle"></p>
+      </div>
+      <div class="etf-detail-kpi" id="etf-detail-kpi"></div>
+      <div class="card chart-card">
+        <div class="card-header">
+          <h3>Évolution du prix</h3>
+          <div class="card-actions" id="etf-chart-actions"></div>
+        </div>
+        <div class="card-body chart-container">
+          <canvas id="etf-price-chart"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h3>Historique des transactions</h3>
+        </div>
+        <div class="card-body">
+          <table class="data-table" id="etf-transactions-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Type</th>
+                <th>Compte</th>
+                <th>Parts</th>
+                <th>Prix</th>
+                <th>Montant</th>
+                <th>Frais</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="view-transactions" class="view">
+      <div class="view-header">
+        <h1>Transactions</h1>
+        <p class="view-subtitle">Historique complet de vos opérations</p>
+      </div>
+      <div class="filters-row" id="filters-row"></div>
+      <div class="card">
+        <div class="card-body">
+          <table class="data-table" id="all-transactions-table">
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Catégorie</th>
+                <th>Type</th>
+                <th>Compte</th>
+                <th>Actif</th>
+                <th>Parts</th>
+                <th>Prix</th>
+                <th>Montant</th>
+                <th>Frais</th>
+                <th>Taxe</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
