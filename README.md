@@ -1,5 +1,7 @@
 # TR Viewer
 
+![Dashboard](demo.png)
+
 Visualisation de relevés de transactions Trade Republic, avec graphiques, suivi par ETF et cours en temps réel.  
 Le fichier de transaction peut être téléchargé depuis l'app TR.  
 
