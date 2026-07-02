@@ -5,6 +5,9 @@ const ETF_COLORS = [
 ];
 
 let rawTransactions = [];
+let liveQuotes = {};
+let fxRates = {};
+let priceHistories = {};
 let portfolioChart = null;
 let allocationChart = null;
 let etfPriceChart = null;
@@ -67,6 +70,105 @@ function parseCSV(text) {
   }));
 }
 
+async function fetchLiveQuotes(isins) {
+  if (isins.length === 0) return;
+  try {
+    const params = isins.map(i => `isin=${encodeURIComponent(i)}`).join('&');
+    const resp = await fetch(`/api/quotes?${params}`);
+    if (resp.ok) {
+      liveQuotes = await resp.json();
+      const currencies = new Set();
+      for (const [, q] of Object.entries(liveQuotes)) {
+        if (q.currency && q.currency !== 'EUR') currencies.add(q.currency);
+      }
+      for (const cur of currencies) {
+        if (!fxRates[cur]) {
+          try {
+            const fxResp = await fetch(`/api/fx?base=${cur}&quote=EUR`);
+            if (fxResp.ok) {
+              const fxData = await fxResp.json();
+              fxRates[cur] = fxData.rate;
+            }
+          } catch {}
+        }
+      }
+    }
+  } catch {
+    liveQuotes = {};
+  }
+}
+
+async function fetchPriceHistories(isins) {
+  if (isins.length === 0) return;
+  const dates = rawTransactions.map(t => t.date).sort();
+  if (dates.length === 0) return;
+  const startDate = dates[0];
+  const today = new Date().toISOString().split('T')[0];
+  for (const isin of isins) {
+    try {
+      const resp = await fetch(
+        `/api/history?isin=${encodeURIComponent(isin)}&start=${startDate}&end=${today}`
+      );
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.history && data.history.length > 0) {
+          const currency = data.currency || 'USD';
+          const fx = currency === 'EUR' ? 1 : (fxRates[currency] || null);
+          if (fx !== null) {
+            priceHistories[isin] = {};
+            for (const entry of data.history) {
+              priceHistories[isin][entry.date] = entry.close * fx;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+}
+
+function getMarketPrice(symbol, date) {
+  const hist = priceHistories[symbol];
+  if (!hist) return null;
+  if (hist[date] !== undefined) return hist[date];
+  const sortedDates = Object.keys(hist).sort();
+  let closest = null;
+  for (const d of sortedDates) {
+    if (d <= date) closest = hist[d];
+    else break;
+  }
+  return closest;
+}
+
+function getLatestMarketPrice(symbol) {
+  const hist = priceHistories[symbol];
+  if (!hist) return null;
+  const dates = Object.keys(hist).sort();
+  if (dates.length === 0) return null;
+  return hist[dates[dates.length - 1]];
+}
+
+function hasLivePrices() {
+  return Object.keys(liveQuotes).some(k => !liveQuotes[k].error);
+}
+
+function hasPriceHistory() {
+  return Object.keys(priceHistories).length > 0;
+}
+
+function getLivePriceEur(symbol) {
+  const q = liveQuotes[symbol];
+  if (!q || q.error) return null;
+  const fx = q.currency === 'EUR' ? 1 : (fxRates[q.currency] || null);
+  if (fx === null) return null;
+  return q.price * fx;
+}
+
+function getLiveDailyChange(symbol) {
+  const q = liveQuotes[symbol];
+  if (!q || q.error) return null;
+  return q.dailyChange;
+}
+
 function getTradingTransactions() {
   return rawTransactions.filter(t => t.category === 'TRADING');
 }
@@ -99,24 +201,29 @@ function getAssetHoldings() {
     let totalShares = 0;
     let totalCost = 0;
     let totalFees = 0;
-    let lastPrice = 0;
+    let lastBuyPrice = 0;
     const priceHistory = [];
     for (const t of trades) {
       if (t.type === 'BUY') {
         totalShares += t.shares;
         totalCost += Math.abs(t.amount);
         totalFees += Math.abs(t.fee);
-        lastPrice = t.price;
+        lastBuyPrice = t.price;
         priceHistory.push({ date: t.date, price: t.price, shares: totalShares });
       } else if (t.type === 'SELL') {
         totalShares -= t.shares;
         totalCost -= (t.shares * t.price);
-        lastPrice = t.price;
+        lastBuyPrice = t.price;
         priceHistory.push({ date: t.date, price: t.price, shares: totalShares });
       }
     }
     const avgPrice = totalShares > 0 ? totalCost / totalShares : 0;
-    const currentValue = totalShares * lastPrice;
+    const livePrice = getLivePriceEur(symbol);
+    const histPrice = getLatestMarketPrice(symbol);
+    const currentPrice = livePrice !== null ? livePrice : histPrice !== null ? histPrice : lastBuyPrice;
+    const priceSource = livePrice !== null ? 'live' : histPrice !== null ? 'history' : 'last-buy';
+    const dailyChange = getLiveDailyChange(symbol);
+    const currentValue = totalShares * currentPrice;
     const invested = totalCost + totalFees;
     let pnl = currentValue - invested;
     if (Math.abs(pnl) < 0.005) pnl = 0;
@@ -128,7 +235,10 @@ function getAssetHoldings() {
       totalCost,
       totalFees,
       invested,
-      lastPrice,
+      lastBuyPrice,
+      currentPrice,
+      priceSource,
+      dailyChange,
       currentValue,
       pnl,
       pnlPct,
@@ -142,48 +252,73 @@ function getAssetHoldings() {
 function getPortfolioTimeline() {
   const buys = getBuys().sort((a, b) => a.date.localeCompare(b.date));
   if (buys.length === 0) return [];
-  const dailyMap = new Map();
+  const allDates = [...new Set(rawTransactions.map(t => t.date))].sort();
+  const sharesAtDate = new Map();
+  const assets = getUniqueAssets();
+  for (const [symbol] of assets) {
+    sharesAtDate.set(symbol, 0);
+  }
   let cumulInvested = 0;
   let cumulFees = 0;
-  const assetLastPrice = new Map();
-  const assetShares = new Map();
-  const deposits = rawTransactions
-    .filter(t => t.type === 'TRANSFER_INSTANT_INBOUND' || t.type === 'TRANSFER_INBOUND')
-    .reduce((s, t) => s + Math.abs(t.amount), 0);
-  const allDates = [...new Set(rawTransactions.map(t => t.date))].sort();
-  for (const t of buys) {
-    if (!assetShares.has(t.symbol)) {
-      assetShares.set(t.symbol, 0);
-    }
-    assetShares.set(t.symbol, assetShares.get(t.symbol) + t.shares);
-    assetLastPrice.set(t.symbol, t.price);
-    cumulInvested += Math.abs(t.amount);
-    cumulFees += t.fee;
-  }
+  const snapshots = [];
+  let buyIdx = 0;
+  const sortedBuys = [...buys];
   for (const d of allDates) {
-    const dayTrades = buys.filter(t => t.date <= d);
-    if (dayTrades.length === 0) continue;
-    let inv = 0;
-    let fees = 0;
+    while (buyIdx < sortedBuys.length && sortedBuys[buyIdx].date <= d) {
+      const t = sortedBuys[buyIdx];
+      sharesAtDate.set(t.symbol, (sharesAtDate.get(t.symbol) || 0) + t.shares);
+      cumulInvested += Math.abs(t.amount);
+      cumulFees += Math.abs(t.fee);
+      buyIdx++;
+    }
+    const hasAnyShares = [...sharesAtDate.values()].some(s => s > 0);
+    if (!hasAnyShares) continue;
     let val = 0;
-    const sMap = new Map();
-    const pMap = new Map();
-    for (const t of dayTrades) {
-      if (!sMap.has(t.symbol)) sMap.set(t.symbol, 0);
-      sMap.set(t.symbol, sMap.get(t.symbol) + t.shares);
-      pMap.set(t.symbol, t.price);
-      inv += Math.abs(t.amount);
-      fees += t.fee;
+    for (const [sym, shares] of sharesAtDate) {
+      if (shares <= 0) continue;
+      const marketPrice = getMarketPrice(sym, d);
+      const livePrice = getLivePriceEur(sym);
+      let price;
+      if (d === allDates[allDates.length - 1] && livePrice !== null) {
+        price = livePrice;
+      } else if (marketPrice !== null) {
+        price = marketPrice;
+      } else {
+        let lastKnown = 0;
+        for (const t of sortedBuys) {
+          if (t.symbol === sym && t.date <= d) lastKnown = t.price;
+        }
+        price = lastKnown;
+      }
+      val += shares * price;
     }
-    for (const [sym, shares] of sMap) {
-      val += shares * (pMap.get(sym) || 0);
-    }
-    dailyMap.set(d, { invested: inv + fees, value: val });
+    snapshots.push({ date: d, invested: cumulInvested + cumulFees, value: val });
   }
-  return Array.from(dailyMap.entries()).map(([date, data]) => ({
-    date,
-    ...data
-  }));
+  if (hasPriceHistory()) {
+    const histDates = new Set();
+    for (const sym of assets.keys()) {
+      for (const d of Object.keys(priceHistories[sym] || {})) {
+        histDates.add(d);
+      }
+    }
+    const extraDates = [...histDates].filter(d => !allDates.includes(d)).sort();
+    const lastTxDate = allDates[allDates.length - 1];
+    for (const d of extraDates) {
+      if (d > lastTxDate) continue;
+      let val = 0;
+      for (const [sym, shares] of sharesAtDate) {
+        if (shares <= 0) continue;
+        const marketPrice = getMarketPrice(sym, d);
+        if (marketPrice === null) continue;
+        val += shares * marketPrice;
+      }
+      if (val > 0) {
+        snapshots.push({ date: d, invested: cumulInvested + cumulFees, value: val });
+      }
+    }
+    snapshots.sort((a, b) => a.date.localeCompare(b.date));
+  }
+  return snapshots;
 }
 
 function getTotalDeposits() {
@@ -220,6 +355,12 @@ function getTotalPortfolioValue() {
   return total;
 }
 
+function priceLabel(source) {
+  if (source === 'live') return 'Prix live';
+  if (source === 'history') return 'Prix de marché';
+  return 'Dernier achat';
+}
+
 function renderKPIs() {
   const row = $('#kpi-row');
   const invested = getTotalInvested();
@@ -229,9 +370,10 @@ function renderKPIs() {
   const deposits = getTotalDeposits();
   const interest = getTotalInterest();
   const fees = getTotalFees();
+  const live = hasLivePrices();
   row.innerHTML = `
     <div class="kpi-card">
-      <div class="kpi-label">Valeur portefeuille</div>
+      <div class="kpi-label">Valeur portefeuille${live ? ' <span class="live-dot"></span>' : ''}</div>
       <div class="kpi-value">${fmtCurrency(value)}</div>
     </div>
     <div class="kpi-card">
@@ -239,7 +381,7 @@ function renderKPIs() {
       <div class="kpi-value">${fmtCurrency(invested)}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">P&L non réalisé</div>
+      <div class="kpi-label">P&L${live ? ' temps réel' : ''}</div>
       <div class="kpi-value ${pnl >= 0 ? 'positive' : 'negative'}">${fmtCurrency(pnl)}</div>
       <div class="kpi-sub ${pnl >= 0 ? 'positive' : 'negative'}">${fmtPct(pnlPct)}</div>
     </div>
@@ -279,7 +421,7 @@ function renderPortfolioChart() {
           backgroundColor: 'rgba(200,164,78,0.08)',
           fill: true,
           tension: 0.3,
-          pointRadius: 3,
+          pointRadius: timeline.length > 60 ? 0 : 3,
           pointBackgroundColor: '#c8a44e',
           pointBorderWidth: 0,
           borderWidth: 2,
@@ -324,6 +466,7 @@ function renderPortfolioChart() {
           bodyFont: { family: "'JetBrains Mono'", size: 12 },
           padding: 12,
           callbacks: {
+            title: items => fmtDate(items[0].label),
             label: ctx => ctx.dataset.label + ': ' + fmtCurrency(ctx.parsed.y)
           }
         }
@@ -335,10 +478,8 @@ function renderPortfolioChart() {
             color: '#5c5b57',
             font: { family: "'DM Sans'", size: 11 },
             maxRotation: 0,
-            callback: function(val, i) {
-              const label = this.getLabelForValue(val);
-              return fmtDateShort(label);
-            }
+            maxTicksLimit: 12,
+            callback: function(val) { return fmtDateShort(this.getLabelForValue(val)); }
           },
           grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
         },
@@ -419,10 +560,17 @@ function renderHoldingsTable() {
   const tbody = $('#holdings-table tbody');
   const entries = [...holdings.values()].filter(h => h.totalShares > 0);
   if (entries.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--text-3);padding:32px">Aucune position</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-3);padding:32px">Aucune position</td></tr>';
     return;
   }
-  tbody.innerHTML = entries.map(h => `
+  tbody.innerHTML = entries.map(h => {
+    const priceCell = h.priceSource === 'live'
+      ? `<span class="live-indicator">${fmtCurrency(h.currentPrice)}</span>`
+      : fmtCurrency(h.currentPrice);
+    const dailyChangeHtml = h.dailyChange !== null
+      ? `<span class="${h.dailyChange >= 0 ? 'positive' : 'negative'}" style="font-size:0.75rem;margin-left:4px">${fmtPct(h.dailyChange)}</span>`
+      : '';
+    return `
     <tr class="clickable-row" data-symbol="${h.symbol}">
       <td>
         <div class="asset-name">
@@ -433,11 +581,11 @@ function renderHoldingsTable() {
       <td class="mono">${fmt(h.totalShares, 4)}</td>
       <td class="mono">${fmtCurrency(h.avgPrice)}</td>
       <td class="mono">${fmtCurrency(h.invested)}</td>
-      <td class="mono">${fmtCurrency(h.lastPrice)}</td>
+      <td class="mono">${priceCell}${dailyChangeHtml}</td>
       <td class="mono">${fmtCurrency(h.currentValue)}</td>
       <td class="mono ${h.pnl >= 0 ? 'positive' : 'negative'}">${fmtCurrency(h.pnl)}<br><small>${fmtPct(h.pnlPct)}</small></td>
-    </tr>
-  `).join('');
+    </tr>`;
+  }).join('');
   tbody.querySelectorAll('.clickable-row').forEach(row => {
     row.addEventListener('click', () => {
       navigateToEtf(row.dataset.symbol);
@@ -483,6 +631,11 @@ function renderEtfDetail(symbol) {
   $('#etf-detail-title').textContent = h.name;
   $('#etf-detail-subtitle').textContent = h.symbol + ' · ' + h.assetClass;
   const kpiRow = $('#etf-detail-kpi');
+  const priceLabelStr = priceLabel(h.priceSource);
+  const liveTag = h.priceSource === 'live' ? ' <span class="live-dot"></span>' : '';
+  const dailyChangeHtml = h.dailyChange !== null
+    ? `<div class="kpi-sub ${h.dailyChange >= 0 ? 'positive' : 'negative'}">${fmtPct(h.dailyChange)} ce jour</div>`
+    : '';
   kpiRow.innerHTML = `
     <div class="kpi-card">
       <div class="kpi-label">Parts détenues</div>
@@ -493,8 +646,9 @@ function renderEtfDetail(symbol) {
       <div class="kpi-value">${fmtCurrency(h.avgPrice)}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Dernier prix</div>
-      <div class="kpi-value">${fmtCurrency(h.lastPrice)}</div>
+      <div class="kpi-label">${priceLabelStr}${liveTag}</div>
+      <div class="kpi-value">${fmtCurrency(h.currentPrice)}</div>
+      ${dailyChangeHtml}
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Total investi</div>
@@ -518,109 +672,227 @@ function renderEtfDetail(symbol) {
 function renderEtfPriceChart(h) {
   const ctx = $('#etf-price-chart');
   if (etfPriceChart) etfPriceChart.destroy();
-  const history = h.priceHistory;
-  if (history.length === 0) {
-    etfPriceChart = null;
-    return;
-  }
-  etfPriceChart = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: history.map(p => p.date),
-      datasets: [
-        {
-          label: 'Prix',
-          data: history.map(p => p.price),
-          borderColor: h.color,
-          backgroundColor: hexToRgba(h.color, 0.08),
-          fill: true,
-          tension: 0.3,
-          pointRadius: 5,
-          pointBackgroundColor: h.color,
-          pointBorderWidth: 0,
-          borderWidth: 2,
-          yAxisID: 'y',
-        },
-        {
-          label: 'Parts cumulées',
-          data: history.map(p => p.shares),
-          borderColor: '#5c5b57',
-          borderDash: [4, 3],
-          backgroundColor: 'transparent',
-          fill: false,
-          tension: 0.1,
-          pointRadius: 0,
-          borderWidth: 1.5,
-          yAxisID: 'y1',
-        }
-      ]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: {
-          display: true,
-          position: 'top',
-          align: 'end',
-          labels: {
-            color: '#8a8983',
-            font: { family: "'DM Sans'", size: 12 },
-            boxWidth: 12,
-            boxHeight: 2,
-            padding: 16,
-          }
-        },
-        tooltip: {
-          backgroundColor: '#25262b',
-          titleColor: '#f0efe8',
-          bodyColor: '#c4c3bc',
-          borderColor: '#2a2b30',
-          borderWidth: 1,
-          bodyFont: { family: "'JetBrains Mono'", size: 12 },
-          padding: 12,
-          callbacks: {
-            title: items => fmtDate(items[0].label),
-            label: ctx => {
-              if (ctx.datasetIndex === 0) return 'Prix: ' + fmtCurrency(ctx.parsed.y);
-              return 'Parts: ' + fmt(ctx.parsed.y, 4);
-            }
-          }
-        }
-      },
-      scales: {
-        x: {
-          type: 'category',
-          ticks: {
-            color: '#5c5b57',
-            font: { family: "'DM Sans'", size: 11 },
-            maxRotation: 0,
-            callback: function(val) { return fmtDateShort(this.getLabelForValue(val)); }
-          },
-          grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
-        },
-        y: {
-          position: 'left',
-          ticks: {
-            color: '#5c5b57',
-            font: { family: "'JetBrains Mono'", size: 11 },
-            callback: v => fmtCurrency(v)
-          },
-          grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
-        },
-        y1: {
-          position: 'right',
-          ticks: {
-            color: '#5c5b57',
-            font: { family: "'JetBrains Mono'", size: 11 },
-            callback: v => fmt(v, 1)
-          },
-          grid: { display: false }
-        }
+  const hist = priceHistories[h.symbol];
+  if (hist && Object.keys(hist).length > 0) {
+    const dates = Object.keys(hist).sort();
+    const labels = [...dates];
+    const prices = dates.map(d => hist[d]);
+    const sharesData = dates.map(d => {
+      let shares = 0;
+      for (const t of h.trades) {
+        if (t.type === 'BUY' && t.date <= d) shares += t.shares;
+      }
+      return shares;
+    });
+    if (h.priceSource === 'live') {
+      const today = new Date().toISOString().split('T')[0];
+      if (!labels.includes(today)) {
+        labels.push(today);
+        prices.push(h.currentPrice);
+        sharesData.push(h.totalShares);
       }
     }
-  });
+    etfPriceChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [
+          {
+            label: 'Prix de marché',
+            data: prices,
+            borderColor: h.color,
+            backgroundColor: hexToRgba(h.color, 0.08),
+            fill: true,
+            tension: 0.2,
+            pointRadius: 0,
+            pointHoverRadius: 4,
+            pointBackgroundColor: h.color,
+            borderWidth: 2,
+            yAxisID: 'y',
+          },
+          {
+            label: 'Parts détenues',
+            data: sharesData,
+            borderColor: '#5c5b57',
+            borderDash: [4, 3],
+            backgroundColor: 'transparent',
+            fill: false,
+            tension: 0.1,
+            pointRadius: 0,
+            borderWidth: 1.5,
+            yAxisID: 'y1',
+            stepped: 'after',
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            position: 'top',
+            align: 'end',
+            labels: {
+              color: '#8a8983',
+              font: { family: "'DM Sans'", size: 12 },
+              boxWidth: 12,
+              boxHeight: 2,
+              padding: 16,
+            }
+          },
+          tooltip: {
+            backgroundColor: '#25262b',
+            titleColor: '#f0efe8',
+            bodyColor: '#c4c3bc',
+            borderColor: '#2a2b30',
+            borderWidth: 1,
+            bodyFont: { family: "'JetBrains Mono'", size: 12 },
+            padding: 12,
+            callbacks: {
+              title: items => fmtDate(items[0].label),
+              label: ctx => {
+                if (ctx.datasetIndex === 0) return 'Prix: ' + fmtCurrency(ctx.parsed.y);
+                return 'Parts: ' + fmt(ctx.parsed.y, 4);
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            type: 'category',
+            ticks: {
+              color: '#5c5b57',
+              font: { family: "'DM Sans'", size: 11 },
+              maxRotation: 0,
+              maxTicksLimit: 10,
+              callback: function(val) { return fmtDateShort(this.getLabelForValue(val)); }
+            },
+            grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
+          },
+          y: {
+            position: 'left',
+            ticks: {
+              color: '#5c5b57',
+              font: { family: "'JetBrains Mono'", size: 11 },
+              callback: v => fmtCurrency(v)
+            },
+            grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
+          },
+          y1: {
+            position: 'right',
+            ticks: {
+              color: '#5c5b57',
+              font: { family: "'JetBrains Mono'", size: 11 },
+              callback: v => fmt(v, 1)
+            },
+            grid: { display: false }
+          }
+        }
+      }
+    });
+  } else {
+    const history = h.priceHistory;
+    if (history.length === 0) { etfPriceChart = null; return; }
+    const datasets = [
+      {
+        label: 'Prix (achat)',
+        data: history.map(p => p.price),
+        borderColor: h.color,
+        backgroundColor: hexToRgba(h.color, 0.08),
+        fill: true,
+        tension: 0.3,
+        pointRadius: 5,
+        pointBackgroundColor: h.color,
+        pointBorderWidth: 0,
+        borderWidth: 2,
+        yAxisID: 'y',
+      },
+      {
+        label: 'Parts cumulées',
+        data: history.map(p => p.shares),
+        borderColor: '#5c5b57',
+        borderDash: [4, 3],
+        backgroundColor: 'transparent',
+        fill: false,
+        tension: 0.1,
+        pointRadius: 0,
+        borderWidth: 1.5,
+        yAxisID: 'y1',
+      }
+    ];
+    const labels = history.map(p => p.date);
+    etfPriceChart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            display: true,
+            position: 'top',
+            align: 'end',
+            labels: {
+              color: '#8a8983',
+              font: { family: "'DM Sans'", size: 12 },
+              boxWidth: 12,
+              boxHeight: 2,
+              padding: 16,
+            }
+          },
+          tooltip: {
+            backgroundColor: '#25262b',
+            titleColor: '#f0efe8',
+            bodyColor: '#c4c3bc',
+            borderColor: '#2a2b30',
+            borderWidth: 1,
+            bodyFont: { family: "'JetBrains Mono'", size: 12 },
+            padding: 12,
+            callbacks: {
+              title: items => fmtDate(items[0].label),
+              label: ctx => {
+                if (ctx.datasetIndex === 0) return 'Prix: ' + fmtCurrency(ctx.parsed.y);
+                return 'Parts: ' + fmt(ctx.parsed.y, 4);
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            type: 'category',
+            ticks: {
+              color: '#5c5b57',
+              font: { family: "'DM Sans'", size: 11 },
+              maxRotation: 0,
+              callback: function(val) { return fmtDateShort(this.getLabelForValue(val)); }
+            },
+            grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
+          },
+          y: {
+            position: 'left',
+            ticks: {
+              color: '#5c5b57',
+              font: { family: "'JetBrains Mono'", size: 11 },
+              callback: v => fmtCurrency(v)
+            },
+            grid: { color: 'rgba(42,43,48,0.5)', drawBorder: false }
+          },
+          y1: {
+            position: 'right',
+            ticks: {
+              color: '#5c5b57',
+              font: { family: "'JetBrains Mono'", size: 11 },
+              callback: v => fmt(v, 1)
+            },
+            grid: { display: false }
+          }
+        }
+      }
+    });
+  }
 }
 
 function renderEtfTransactionsTable(h) {
@@ -723,6 +995,7 @@ function hexToRgba(hex, alpha) {
 }
 
 function initNavigation() {
+  $('#brand-home').addEventListener('click', () => switchView('dashboard'));
   $$('.nav-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const view = btn.dataset.view;
@@ -741,21 +1014,37 @@ function initNavigation() {
 
 function handleCSVUpload(file) {
   const reader = new FileReader();
-  reader.onload = e => {
+  reader.onload = async e => {
     rawTransactions = parseCSV(e.target.result);
     selectedEtf = null;
     txFilterCategory = 'ALL';
+    liveQuotes = {};
+    fxRates = {};
+    priceHistories = {};
+    await refreshLiveData();
     renderDashboard();
     renderEtfSidebarList();
   };
   reader.readAsText(file);
 }
 
+async function refreshLiveData() {
+  const assets = getUniqueAssets();
+  const isins = [...assets.keys()];
+  if (isins.length > 0) {
+    await fetchLiveQuotes(isins);
+    await fetchPriceHistories(isins);
+  }
+}
+
 function loadDefaultCSV() {
   fetch('transaction.csv')
     .then(r => r.text())
-    .then(text => {
+    .then(async text => {
       rawTransactions = parseCSV(text);
+      renderDashboard();
+      renderEtfSidebarList();
+      await refreshLiveData();
       renderDashboard();
       renderEtfSidebarList();
     })
