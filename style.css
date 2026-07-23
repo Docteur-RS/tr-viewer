@@ -402,6 +402,14 @@ body {
 .data-table .positive { color: var(--green); }
 .data-table .negative { color: var(--red); }
 
+.data-table tfoot .totals-row td {
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  border-bottom: none;
+  font-weight: 600;
+  color: var(--text-0);
+}
+
 .data-table .asset-name {
   display: flex;
   flex-direction: column;

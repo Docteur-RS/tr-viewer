@@ -140,6 +140,7 @@
         <p class="view-subtitle">Historique complet de vos opérations</p>
       </div>
       <div class="filters-row" id="filters-row"></div>
+      <div class="filters-row" id="account-filters-row"></div>
       <div class="card">
         <div class="card-body">
           <table class="data-table" id="all-transactions-table">
@@ -158,6 +159,16 @@
               </tr>
             </thead>
             <tbody></tbody>
+            <tfoot>
+              <tr class="totals-row">
+                <td colspan="5">Total</td>
+                <td class="mono" id="tx-total-shares"></td>
+                <td></td>
+                <td class="mono" id="tx-total-amount"></td>
+                <td class="mono" id="tx-total-fees"></td>
+                <td class="mono" id="tx-total-tax"></td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       </div>

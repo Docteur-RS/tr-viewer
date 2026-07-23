@@ -13,6 +13,7 @@ let allocationChart = null;
 let etfPriceChart = null;
 let selectedEtf = null;
 let txFilterCategory = 'ALL';
+let txFilterAccount = 'ALL';
 
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -54,7 +55,7 @@ function parseCSV(text) {
   return result.data.map(row => ({
     datetime: row.datetime,
     date: row.date,
-    accountType: row.account_type,
+    accountType: row.account_type === 'DEFAULT' ? 'CTO' : row.account_type,
     category: row.category,
     type: row.type,
     assetClass: row.asset_class || '',
@@ -953,9 +954,27 @@ function renderTransactionsView() {
       renderTransactionsView();
     });
   });
+
+  const accountFiltersRow = $('#account-filters-row');
+  const accounts = ['ALL', ...new Set(rawTransactions.map(t => t.accountType))];
+  const accountLabels = { ALL: 'Tous les comptes' };
+  accounts.forEach(a => { if (a !== 'ALL') accountLabels[a] = a; });
+  accountFiltersRow.innerHTML = accounts.map(a => `
+    <button class="filter-chip ${txFilterAccount === a ? 'active' : ''}" data-account="${a}">${accountLabels[a]}</button>
+  `).join('');
+  accountFiltersRow.querySelectorAll('.filter-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      txFilterAccount = btn.dataset.account;
+      renderTransactionsView();
+    });
+  });
+
   let txs = [...rawTransactions].sort((a, b) => b.date.localeCompare(a.date));
   if (txFilterCategory !== 'ALL') {
     txs = txs.filter(t => t.category === txFilterCategory);
+  }
+  if (txFilterAccount !== 'ALL') {
+    txs = txs.filter(t => t.accountType === txFilterAccount);
   }
   const tbody = $('#all-transactions-table tbody');
   tbody.innerHTML = txs.map(t => `
@@ -972,6 +991,17 @@ function renderTransactionsView() {
       <td class="mono">${t.tax ? fmtCurrency(t.tax) : '—'}</td>
     </tr>
   `).join('');
+
+  const totalShares = txs.reduce((s, t) => s + (parseFloat(t.shares) || 0), 0);
+  const totalAmount = txs.reduce((s, t) => s + (parseFloat(t.amount) || 0), 0);
+  const totalFees = txs.reduce((s, t) => s + (parseFloat(t.fee) || 0), 0);
+  const totalTax = txs.reduce((s, t) => s + (parseFloat(t.tax) || 0), 0);
+
+  $('#tx-total-shares').textContent = totalShares ? fmt(totalShares, 4) : '—';
+  $('#tx-total-amount').textContent = totalAmount ? fmtCurrency(Math.abs(totalAmount)) : '—';
+  $('#tx-total-amount').className = `mono ${totalAmount < 0 ? 'negative' : totalAmount > 0 ? 'positive' : ''}`;
+  $('#tx-total-fees').textContent = totalFees ? fmtCurrency(totalFees) : '—';
+  $('#tx-total-tax').textContent = totalTax ? fmtCurrency(totalTax) : '—';
 }
 
 function switchView(viewName) {
@@ -1018,6 +1048,7 @@ function handleCSVUpload(file) {
     rawTransactions = parseCSV(e.target.result);
     selectedEtf = null;
     txFilterCategory = 'ALL';
+    txFilterAccount = 'ALL';
     liveQuotes = {};
     fxRates = {};
     priceHistories = {};
